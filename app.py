@@ -390,8 +390,8 @@ def admin_login():
     username = st.text_input("Usuário", key="admin_username")
     password = st.text_input("Senha", type="password", key="admin_password")
     if st.button("Entrar", type="primary", key="admin_login_button"):
-        expected_user = secret_value("ADMIN_USERNAME")
-        expected_password = secret_value("ADMIN_PASSWORD")
+        expected_user = secret_value("ADMIN_USERNAME", "SSBMGF")
+        expected_password = secret_value("ADMIN_PASSWORD", "SSBMGF")
         if not expected_user or not expected_password:
             st.error("As credenciais ainda não foram configuradas nos Secrets da aplicação.")
         elif username == expected_user and password == expected_password:
@@ -751,7 +751,7 @@ st.markdown("""
 </style>
 <div class="mini-hero">
   <h1>🛒 Mini Market</h1>
-  <p>Team Building · operação local preparada para SQLite</p>
+  <p>Team Building · Resource &amp; Cost Challenge</p>
 </div>
 """, unsafe_allow_html=True)
 
