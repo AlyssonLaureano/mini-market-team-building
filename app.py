@@ -15,6 +15,7 @@ st.set_page_config(
     page_title="Mini Market | Team Building",
     page_icon="🛒",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 # -----------------------------
@@ -339,14 +340,15 @@ def product_icon(product_name):
 def access_url():
     """URL acessível pelo celular na mesma rede da máquina que executa o app."""
     configured = os.getenv("MINI_MARKET_URL")
+    if not configured:
+        try:
+            configured = st.secrets.get("MINI_MARKET_URL")
+        except Exception:
+            configured = None
     if configured:
-        return configured
+        return str(configured).rstrip("/")
 
-    # Endereço da rede Scania usado nesta atividade. Pode ser substituído
-    # quando o DHCP atribuir outro IP, usando MINI_MARKET_URL.
-    preferred_ip = "10.201.234.64"
-    port = os.getenv("STREAMLIT_SERVER_PORT", "8501")
-    return f"http://{preferred_ip}:{port}"
+    return "https://mini-market-team-building-hgnnwkku3kdzlxaozjravs.streamlit.app"
 
 
 
@@ -355,6 +357,112 @@ def qr_bytes(url):
     output = io.BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
+
+
+def import_admin_workbook(uploaded_file, reset_activity=False):
+    """Importa Grupos e Produtos sem apagar o histórico de compras."""
+    groups_df = pd.read_excel(uploaded_file, sheet_name="Grupos", header=3)
+    products_df = pd.read_excel(uploaded_file, sheet_name="Produtos", header=3)
+
+    group_required = {"group_id", "group_name", "initial_balance"}
+    product_required = {"product_id", "product_name", "unit_price", "initial_stock"}
+
+    missing_groups = group_required - set(groups_df.columns)
+    missing_products = product_required - set(products_df.columns)
+    if missing_groups:
+        raise ValueError(f"Campos ausentes na aba Grupos: {', '.join(sorted(missing_groups))}")
+    if missing_products:
+        raise ValueError(f"Campos ausentes na aba Produtos: {', '.join(sorted(missing_products))}")
+
+    groups_df = groups_df.dropna(how="all").copy()
+    products_df = products_df.dropna(how="all").copy()
+
+    for df, id_col, label in [
+        (groups_df, "group_id", "Grupos"),
+        (products_df, "product_id", "Produtos"),
+    ]:
+        if df[id_col].isna().any():
+            raise ValueError(f"Há código vazio na aba {label}.")
+        if df[id_col].duplicated().any():
+            duplicated = df.loc[df[id_col].duplicated(), id_col].tolist()
+            raise ValueError(f"Há códigos duplicados na aba {label}: {duplicated}")
+
+    groups_df["group_id"] = pd.to_numeric(groups_df["group_id"], errors="coerce")
+    groups_df["initial_balance"] = pd.to_numeric(groups_df["initial_balance"], errors="coerce")
+    products_df["product_id"] = pd.to_numeric(products_df["product_id"], errors="coerce")
+    products_df["unit_price"] = pd.to_numeric(products_df["unit_price"], errors="coerce")
+    products_df["initial_stock"] = pd.to_numeric(products_df["initial_stock"], errors="coerce")
+
+    if groups_df[["group_id", "initial_balance"]].isna().any().any():
+        raise ValueError("Código ou saldo inicial inválido na aba Grupos.")
+    if products_df[["product_id", "unit_price", "initial_stock"]].isna().any().any():
+        raise ValueError("Código, preço ou estoque inicial inválido na aba Produtos.")
+    if (groups_df["initial_balance"] < 0).any():
+        raise ValueError("O saldo inicial não pode ser negativo.")
+    if (products_df[["unit_price", "initial_stock"]] < 0).any().any():
+        raise ValueError("Preço e estoque inicial não podem ser negativos.")
+
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in groups_df.itertuples(index=False):
+            group_id = int(row.group_id)
+            name = str(row.group_name).strip()
+            if not name or name == "nan":
+                raise ValueError(f"Nome vazio para o grupo {group_id}.")
+            balance = float(row.initial_balance)
+            existing = conn.execute(
+                "SELECT group_id FROM groups WHERE group_id = ?", (group_id,)
+            ).fetchone()
+            if existing and not reset_activity:
+                conn.execute(
+                    "UPDATE groups SET group_name = ?, initial_balance = ? WHERE group_id = ?",
+                    (name, balance, group_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO groups(group_id, group_name, initial_balance, current_balance)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(group_id) DO UPDATE SET
+                       group_name = excluded.group_name,
+                       initial_balance = excluded.initial_balance,
+                       current_balance = excluded.current_balance""",
+                    (group_id, name, balance, balance),
+                )
+
+        for row in products_df.itertuples(index=False):
+            product_id = int(row.product_id)
+            name = str(row.product_name).strip()
+            if not name or name == "nan":
+                raise ValueError(f"Nome vazio para o produto {product_id}.")
+            price = float(row.unit_price)
+            stock = int(row.initial_stock)
+            existing = conn.execute(
+                "SELECT product_id FROM products WHERE product_id = ?", (product_id,)
+            ).fetchone()
+            if existing and not reset_activity:
+                conn.execute(
+                    "UPDATE products SET product_name = ?, price = ? WHERE product_id = ?",
+                    (name, price, product_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO products(product_id, product_name, price, stock)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(product_id) DO UPDATE SET
+                       product_name = excluded.product_name,
+                       price = excluded.price,
+                       stock = excluded.stock""",
+                    (product_id, name, price, stock),
+                )
+
+        conn.commit()
+        return len(groups_df), len(products_df)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def purchase_email_body(purchase):
@@ -686,12 +794,48 @@ with st.sidebar:
     st.header("⚙️ Administração")
 
     st.caption(
-        "Nesta primeira versão, os dados são mantidos no SQLite local. "
-        "A integração com SharePoint entra na próxima etapa."
+        "Os dados operacionais são mantidos no SQLite. A planilha administrativa "
+        "pode atualizar os cadastros sem apagar o histórico."
     )
 
     if st.button("🔄 Atualizar tela", use_container_width=True):
         st.rerun()
+
+    with st.expander("📥 Importar planilha administrativa"):
+        st.caption(
+            "Use o arquivo Mini_Market_Admin.xlsx. Os cabeçalhos devem permanecer "
+            "nas abas Grupos e Produtos."
+        )
+        uploaded_workbook = st.file_uploader(
+            "Selecione o Excel",
+            type=["xlsx"],
+            key="admin_workbook",
+        )
+        reset_activity = st.checkbox(
+            "Aplicar saldo inicial e estoque da planilha",
+            value=False,
+            help=(
+                "Marque somente para uma carga inicial ou reinício autorizado. "
+                "Se desmarcado, saldos, estoque atual e histórico são preservados."
+            ),
+        )
+        if st.button(
+            "⬆️ Validar e importar",
+            use_container_width=True,
+            disabled=uploaded_workbook is None,
+        ):
+            try:
+                group_count, product_count = import_admin_workbook(
+                    uploaded_workbook,
+                    reset_activity=reset_activity,
+                )
+                st.success(
+                    f"Importação concluída: {group_count} grupos e "
+                    f"{product_count} produtos."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Importação não realizada: {exc}")
 
     if st.button(
         "⚠️ Restaurar dados de teste",
