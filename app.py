@@ -397,6 +397,27 @@ def has_reset_flag(df):
     return False
 
 
+def read_control_sheet(uploaded_file):
+    """Lê os controles opcionais da aba Controle."""
+    try:
+        controls_df = pd.read_excel(uploaded_file, sheet_name="Controle", header=3)
+    except ValueError:
+        return False, False
+
+    required = {"action", "execute"}
+    if not required.issubset(set(controls_df.columns)):
+        raise ValueError("A aba Controle precisa ter as colunas action e execute.")
+
+    controls_df = controls_df.dropna(how="all").copy()
+    enabled = controls_df["execute"].fillna("").astype(str).str.strip().str.lower()
+    actions = controls_df["action"].fillna("").astype(str).str.strip().str.lower()
+    active = enabled.isin({"sim", "s", "yes", "y", "true", "1"})
+    return (
+        bool((active & actions.eq("reset_activity")).any()),
+        bool((active & actions.eq("reset_stock")).any()),
+    )
+
+
 def admin_login():
     if st.session_state.get("admin_authenticated"):
         if st.button("Sair da administração", key="admin_logout"):
@@ -431,6 +452,7 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
     """Importa Grupos e Produtos sem apagar o histórico de compras."""
     groups_df = pd.read_excel(uploaded_file, sheet_name="Grupos", header=3)
     products_df = pd.read_excel(uploaded_file, sheet_name="Produtos", header=3)
+    sheet_reset_activity, sheet_reset_stock = read_control_sheet(uploaded_file)
 
     group_required = {"group_id", "group_name", "initial_balance"}
     product_required = {"product_id", "product_name", "unit_price", "initial_stock"}
@@ -452,9 +474,11 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
 
     reset_requested = (
         reset_activity
+        or sheet_reset_activity
         or has_reset_flag(groups_df)
         or has_reset_flag(products_df)
     )
+    reset_stock_requested = sheet_reset_stock
 
     for df, id_col, label in [
         (groups_df, "group_id", "Grupos"),
@@ -540,8 +564,16 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
                     (product_id, name, price, stock, stock),
                 )
 
+        if reset_stock_requested:
+            conn.execute("UPDATE products SET stock = 0")
+
         conn.commit()
-        return len(groups_df), len(products_df), reset_requested
+        return (
+            len(groups_df),
+            len(products_df),
+            reset_requested,
+            reset_stock_requested,
+        )
     except Exception:
         conn.rollback()
         raise
@@ -640,7 +672,6 @@ def export_admin_workbook():
         "group_id": groups["Código"] if not groups.empty else pd.Series(dtype="int64"),
         "group_name": groups["Grupo"] if not groups.empty else pd.Series(dtype="object"),
         "initial_balance": groups["Saldo inicial"] if not groups.empty else pd.Series(dtype="float64"),
-        "reset_activity": "Não",
         "current_balance": groups["Saldo final"] if not groups.empty else pd.Series(dtype="float64"),
         "total_purchased": groups["Total comprado"] if not groups.empty else pd.Series(dtype="float64"),
         "purchases_count": groups["Compras"] if not groups.empty else pd.Series(dtype="int64"),
@@ -650,11 +681,22 @@ def export_admin_workbook():
         "product_name": stock["Produto"] if not stock.empty else pd.Series(dtype="object"),
         "unit_price": stock["Preço unitário"] if not stock.empty else pd.Series(dtype="float64"),
         "initial_stock": stock["Estoque inicial"] if not stock.empty else pd.Series(dtype="int64"),
-        "reset_activity": "Não",
         "current_stock": stock["Estoque final"] if not stock.empty else pd.Series(dtype="int64"),
         "sold_units": stock["Unidades vendidas"] if not stock.empty else pd.Series(dtype="int64"),
         "sold_total": stock["Total vendido"] if not stock.empty else pd.Series(dtype="float64"),
     })
+    controls_export = pd.DataFrame([
+        {
+            "action": "reset_activity",
+            "execute": "Não",
+            "description": "Apaga compras e restaura saldos e estoques iniciais.",
+        },
+        {
+            "action": "reset_stock",
+            "execute": "Não",
+            "description": "Zera somente o estoque atual e preserva o histórico.",
+        },
+    ])
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -665,7 +707,12 @@ def export_admin_workbook():
             frame.to_excel(writer, sheet_name=sheet_name, index=False, startrow=3)
             worksheet = writer.book[sheet_name]
             worksheet["A1"] = title
-            worksheet["A2"] = "Para iniciar uma nova atividade, altere reset_activity para Sim em uma linha e importe novamente."
+            worksheet["A2"] = "Os campos current_* e totais são informativos. Use a aba Controle para ações de reset."
+
+        controls_export.to_excel(writer, sheet_name="Controle", index=False, startrow=3)
+        control_sheet = writer.book["Controle"]
+        control_sheet["A1"] = "Controles da importação"
+        control_sheet["A2"] = "Altere execute para Sim somente para a ação desejada e importe novamente."
 
         group_items.to_excel(writer, sheet_name="Itens por grupo", index=False)
         history.to_excel(writer, sheet_name="Compras", index=False)
@@ -834,8 +881,7 @@ def render_admin_screen():
     with tab_import:
         st.write("Use o arquivo **Mini_Market_Admin.xlsx** ou uma exportação da situação atual.")
         st.caption(
-            "Para iniciar uma nova atividade, altere `reset_activity` para `Sim` em uma linha "
-            "da aba Grupos ou Produtos. Isso zera compras, saldos e estoques de forma global."
+            "Use a aba Controle para escolher se deseja reiniciar a atividade ou zerar somente o estoque."
         )
         uploaded_workbook = st.file_uploader(
             "Selecione a planilha administrativa",
@@ -855,14 +901,21 @@ def render_admin_screen():
             key="admin_import_main",
         ):
             try:
-                group_count, product_count, reset_from_sheet = import_admin_workbook(
+                (
+                    group_count,
+                    product_count,
+                    reset_from_sheet,
+                    reset_stock_from_sheet,
+                ) = import_admin_workbook(
                     uploaded_workbook,
                     reset_activity=reset_activity,
                 )
                 reset_text = " A atividade anterior foi zerada." if reset_from_sheet else ""
+                stock_text = " O estoque atual foi zerado." if reset_stock_from_sheet else ""
                 st.session_state.admin_import_message = (
                     f"Importação concluída: {group_count} grupos e "
-                    f"{product_count} produtos. O banco foi atualizado.{reset_text}"
+                    f"{product_count} produtos. O banco foi atualizado."
+                    f"{reset_text}{stock_text}"
                 )
                 st.rerun()
             except Exception as exc:
@@ -960,28 +1013,10 @@ if app_mode == "⚙️ Administração":
     st.stop()
 
 # -----------------------------
-# TOP DASHBOARD
-# -----------------------------
-
-st.subheader("💰 Contas dos grupos")
-
-groups = get_groups()
-
-cols = st.columns(len(groups) if groups else 1)
-
-for col, group in zip(cols, groups):
-    with col:
-        st.metric(
-            group["group_name"],
-            money(group["current_balance"]),
-            delta=money(group["current_balance"] - group["initial_balance"]),
-        )
-
-st.divider()
-
-# -----------------------------
 # SHOPPING AREA
 # -----------------------------
+
+groups = get_groups()
 
 left, right = st.columns([1.5, 1])
 
