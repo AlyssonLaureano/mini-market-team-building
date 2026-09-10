@@ -366,11 +366,17 @@ def access_url():
 def secret_value(name, default=None):
     value = os.getenv(name)
     if value:
-        return value
+        return str(value).strip()
     try:
-        return st.secrets.get(name, default)
+        value = st.secrets.get(name)
+        if value is not None:
+            return str(value).strip()
+        general = st.secrets.get("general")
+        if general and general.get(name) is not None:
+            return str(general.get(name)).strip()
     except Exception:
-        return default
+        pass
+    return default
 
 
 def admin_login():
