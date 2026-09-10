@@ -44,7 +44,8 @@ def init_db():
         product_id INTEGER PRIMARY KEY,
         product_name TEXT NOT NULL,
         price REAL NOT NULL DEFAULT 0,
-        stock INTEGER NOT NULL DEFAULT 0
+        stock INTEGER NOT NULL DEFAULT 0,
+        initial_stock INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS purchases (
@@ -68,6 +69,15 @@ def init_db():
         FOREIGN KEY(product_id) REFERENCES products(product_id)
     );
     """)
+
+    product_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()
+    }
+    if "initial_stock" not in product_columns:
+        conn.execute(
+            "ALTER TABLE products ADD COLUMN initial_stock INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute("UPDATE products SET initial_stock = stock WHERE initial_stock = 0")
 
     conn.commit()
     conn.close()
@@ -115,13 +125,14 @@ def seed_test_data():
 
     for product_id, name, price, stock in products:
         conn.execute("""
-            INSERT INTO products(product_id, product_name, price, stock)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO products(product_id, product_name, price, stock, initial_stock)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(product_id) DO UPDATE SET
                 product_name = excluded.product_name,
                 price = excluded.price,
-                stock = excluded.stock
-        """, (product_id, name, price, stock))
+                stock = excluded.stock,
+                initial_stock = excluded.initial_stock
+        """, (product_id, name, price, stock, stock))
 
     conn.commit()
     conn.close()
@@ -352,6 +363,39 @@ def access_url():
 
 
 
+def secret_value(name, default=None):
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def admin_login():
+    if st.session_state.get("admin_authenticated"):
+        if st.button("Sair da administração", key="admin_logout"):
+            st.session_state.admin_authenticated = False
+            st.rerun()
+        return True
+
+    st.warning("Área restrita. Informe as credenciais do administrador.")
+    username = st.text_input("Usuário", key="admin_username")
+    password = st.text_input("Senha", type="password", key="admin_password")
+    if st.button("Entrar", type="primary", key="admin_login_button"):
+        expected_user = secret_value("ADMIN_USERNAME")
+        expected_password = secret_value("ADMIN_PASSWORD")
+        if not expected_user or not expected_password:
+            st.error("As credenciais ainda não foram configuradas nos Secrets da aplicação.")
+        elif username == expected_user and password == expected_password:
+            st.session_state.admin_authenticated = True
+            st.rerun()
+        else:
+            st.error("Usuário ou senha inválidos.")
+    return False
+
+
 def qr_bytes(url):
     image = qrcode.make(url)
     output = io.BytesIO()
@@ -447,13 +491,14 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
                 )
             else:
                 conn.execute(
-                    """INSERT INTO products(product_id, product_name, price, stock)
-                       VALUES (?, ?, ?, ?)
+                    """INSERT INTO products(product_id, product_name, price, stock, initial_stock)
+                       VALUES (?, ?, ?, ?, ?)
                        ON CONFLICT(product_id) DO UPDATE SET
                        product_name = excluded.product_name,
                        price = excluded.price,
-                       stock = excluded.stock""",
-                    (product_id, name, price, stock),
+                       stock = excluded.stock,
+                       initial_stock = excluded.initial_stock""",
+                    (product_id, name, price, stock, stock),
                 )
 
         conn.commit()
@@ -463,6 +508,175 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
         raise
     finally:
         conn.close()
+
+
+def get_admin_stock():
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT
+            pr.product_id,
+            pr.product_name,
+            pr.price,
+            pr.initial_stock,
+            pr.stock AS final_stock,
+            COALESCE(SUM(pi.quantity), 0) AS sold_units
+        FROM products pr
+        LEFT JOIN purchase_items pi ON pi.product_id = pr.product_id
+        GROUP BY pr.product_id, pr.product_name, pr.price, pr.initial_stock, pr.stock
+        ORDER BY pr.product_id
+    """).fetchall()
+    conn.close()
+    return pd.DataFrame([
+        {
+            "Produto": row["product_name"],
+            "Preço unitário": row["price"],
+            "Estoque inicial": row["initial_stock"],
+            "Estoque final": row["final_stock"],
+            "Unidades vendidas": row["sold_units"],
+            "Valor estoque inicial": row["initial_stock"] * row["price"],
+            "Valor estoque final": row["final_stock"] * row["price"],
+        }
+        for row in rows
+    ])
+
+
+def get_admin_groups():
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT
+            g.group_id,
+            g.group_name,
+            g.initial_balance,
+            g.current_balance,
+            COALESCE(COUNT(p.purchase_id), 0) AS purchases_count,
+            COALESCE(SUM(p.total), 0) AS total_spent
+        FROM groups g
+        LEFT JOIN purchases p ON p.group_id = g.group_id
+        GROUP BY g.group_id, g.group_name, g.initial_balance, g.current_balance
+        ORDER BY g.group_id
+    """).fetchall()
+    conn.close()
+    return pd.DataFrame([
+        {
+            "Grupo": row["group_name"],
+            "Saldo inicial": row["initial_balance"],
+            "Total comprado": row["total_spent"],
+            "Saldo final": row["current_balance"],
+            "Compras": row["purchases_count"],
+        }
+        for row in rows
+    ])
+
+
+def get_group_item_summary(group_id):
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT
+            pr.product_name,
+            SUM(pi.quantity) AS quantity,
+            SUM(pi.subtotal) AS total
+        FROM purchase_items pi
+        JOIN purchases p ON p.purchase_id = pi.purchase_id
+        JOIN products pr ON pr.product_id = pi.product_id
+        WHERE p.group_id = ?
+        GROUP BY pr.product_id, pr.product_name
+        ORDER BY total DESC
+    """, (group_id,)).fetchall()
+    conn.close()
+    return pd.DataFrame([
+        {"Produto": row["product_name"], "Quantidade": row["quantity"], "Total": row["total"]}
+        for row in rows
+    ])
+
+
+def render_admin_screen():
+    st.title("⚙️ Administração")
+    st.caption("Visão consolidada do estoque, saldos e compras da atividade.")
+
+    if not admin_login():
+        return
+
+    stock_df = get_admin_stock()
+    groups_df = get_admin_groups()
+    total_initial = stock_df["Valor estoque inicial"].sum() if not stock_df.empty else 0
+    total_final = stock_df["Valor estoque final"].sum() if not stock_df.empty else 0
+    total_spent = groups_df["Total comprado"].sum() if not groups_df.empty else 0
+    total_purchases = groups_df["Compras"].sum() if not groups_df.empty else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Valor estoque inicial", money(total_initial))
+    m2.metric("Valor estoque final", money(total_final))
+    m3.metric("Total comprado", money(total_spent))
+    m4.metric("Compras registradas", int(total_purchases))
+
+    tab_stock, tab_groups, tab_items, tab_import = st.tabs([
+        "📦 Estoque", "👥 Compras por grupo", "🧾 Itens por grupo", "📥 Importar Excel"
+    ])
+
+    with tab_stock:
+        if stock_df.empty:
+            st.info("Nenhum produto cadastrado.")
+        else:
+            display = stock_df.copy()
+            for col in ["Preço unitário", "Valor estoque inicial", "Valor estoque final"]:
+                display[col] = display[col].map(money)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+    with tab_groups:
+        if groups_df.empty:
+            st.info("Nenhum grupo cadastrado.")
+        else:
+            display = groups_df.copy()
+            for col in ["Saldo inicial", "Total comprado", "Saldo final"]:
+                display[col] = display[col].map(money)
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+    with tab_items:
+        if groups_df.empty:
+            st.info("Nenhum grupo cadastrado.")
+        else:
+            group_options = {
+                row["group_name"]: row["group_id"]
+                for row in get_groups()
+            }
+            selected_name = st.selectbox("Selecione o grupo", list(group_options.keys()))
+            items_df = get_group_item_summary(group_options[selected_name])
+            if items_df.empty:
+                st.info("Este grupo ainda não realizou compras.")
+            else:
+                items_df["Total"] = items_df["Total"].map(money)
+                st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+    with tab_import:
+        st.write("Use o arquivo **Mini_Market_Admin.xlsx**.")
+        uploaded_workbook = st.file_uploader(
+            "Selecione a planilha administrativa",
+            type=["xlsx"],
+            key="admin_workbook_main",
+        )
+        reset_activity = st.checkbox(
+            "Aplicar saldo inicial e estoque da planilha",
+            value=False,
+            help="Marque somente na carga inicial ou em um reinício autorizado.",
+            key="admin_reset_main",
+        )
+        if st.button(
+            "⬆️ Validar e importar",
+            type="primary",
+            disabled=uploaded_workbook is None,
+            key="admin_import_main",
+        ):
+            try:
+                group_count, product_count = import_admin_workbook(
+                    uploaded_workbook,
+                    reset_activity=reset_activity,
+                )
+                st.success(
+                    f"Importação concluída: {group_count} grupos e {product_count} produtos."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Importação não realizada: {exc}")
 
 
 def purchase_email_body(purchase):
@@ -547,6 +761,17 @@ with st.expander("📱 Acesso pelo celular", expanded=True):
             "O celular precisa estar na mesma rede Wi‑Fi da máquina que está executando o Streamlit."
         )
 
+with st.sidebar:
+    app_mode = st.radio(
+        "Modo de acesso",
+        ["🛒 Compras", "⚙️ Administração"],
+        index=0,
+    )
+
+if app_mode == "⚙️ Administração":
+    render_admin_screen()
+    st.stop()
+
 # -----------------------------
 # TOP DASHBOARD
 # -----------------------------
@@ -585,16 +810,31 @@ with left:
         for g in groups
     }
 
-    selected_group_name = st.selectbox(
-        "Grupo",
-        list(group_options.keys())
-    )
+    if "cart" not in st.session_state:
+        st.session_state.cart = {}
 
-    selected_group_id = group_options[selected_group_name]
+    group_by_id = {g["group_id"]: g for g in groups}
 
-    selected_group = next(
-        g for g in groups if g["group_id"] == selected_group_id
-    )
+    if st.session_state.get("locked_group_id") not in group_by_id:
+        selected_group_name = st.selectbox(
+            "Selecione o grupo no primeiro acesso",
+            list(group_options.keys()),
+            key="group_login_select",
+        )
+        if st.button("🔐 Confirmar meu grupo", type="primary", key="lock_group"):
+            st.session_state.locked_group_id = group_options[selected_group_name]
+            st.session_state.cart = {}
+            st.rerun()
+        st.info("Depois da confirmação, o grupo ficará fixo nesta sessão do navegador.")
+        st.stop()
+
+    selected_group_id = st.session_state.locked_group_id
+    selected_group = group_by_id[selected_group_id]
+    st.success(f"Grupo fixado nesta sessão: **{selected_group['group_name']}**")
+    if st.button("↩️ Sair e trocar de grupo", key="unlock_group"):
+        st.session_state.pop("locked_group_id", None)
+        st.session_state.cart = {}
+        st.rerun()
 
     st.info(
         f"Saldo inicial: **{money(selected_group['initial_balance'])}**  \n"
@@ -604,9 +844,6 @@ with left:
     st.subheader("2. Escolha os produtos")
 
     products = get_products()
-
-    if "cart" not in st.session_state:
-        st.session_state.cart = {}
 
     product_cols = st.columns(3)
 
@@ -786,88 +1023,5 @@ if history:
 else:
     st.info("Nenhuma compra realizada.")
 
-# -----------------------------
-# ADMIN
-# -----------------------------
-
 with st.sidebar:
-    st.header("⚙️ Administração")
-
-    st.caption(
-        "Os dados operacionais são mantidos no SQLite. A planilha administrativa "
-        "pode atualizar os cadastros sem apagar o histórico."
-    )
-
-    if st.button("🔄 Atualizar tela", use_container_width=True):
-        st.rerun()
-
-    with st.expander("📥 Importar planilha administrativa"):
-        st.caption(
-            "Use o arquivo Mini_Market_Admin.xlsx. Os cabeçalhos devem permanecer "
-            "nas abas Grupos e Produtos."
-        )
-        uploaded_workbook = st.file_uploader(
-            "Selecione o Excel",
-            type=["xlsx"],
-            key="admin_workbook",
-        )
-        reset_activity = st.checkbox(
-            "Aplicar saldo inicial e estoque da planilha",
-            value=False,
-            help=(
-                "Marque somente para uma carga inicial ou reinício autorizado. "
-                "Se desmarcado, saldos, estoque atual e histórico são preservados."
-            ),
-        )
-        if st.button(
-            "⬆️ Validar e importar",
-            use_container_width=True,
-            disabled=uploaded_workbook is None,
-        ):
-            try:
-                group_count, product_count = import_admin_workbook(
-                    uploaded_workbook,
-                    reset_activity=reset_activity,
-                )
-                st.success(
-                    f"Importação concluída: {group_count} grupos e "
-                    f"{product_count} produtos."
-                )
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Importação não realizada: {exc}")
-
-    if st.button(
-        "⚠️ Restaurar dados de teste",
-        use_container_width=True
-    ):
-        conn = get_conn()
-        conn.execute("DELETE FROM purchase_items")
-        conn.execute("DELETE FROM purchases")
-        conn.execute("DELETE FROM groups")
-        conn.execute("DELETE FROM products")
-        conn.commit()
-        conn.close()
-
-        seed_test_data()
-        st.session_state.cart = {}
-        st.rerun()
-
-    st.divider()
-
-    st.subheader("📊 Estoque atual")
-
-    products_admin = get_products()
-
-    st.dataframe(
-        pd.DataFrame([
-            {
-                "Produto": p["product_name"],
-                "Preço": money(p["price"]),
-                "Estoque": p["stock"],
-            }
-            for p in products_admin
-        ]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.caption("Use o seletor acima para alternar entre Compras e Administração.")
