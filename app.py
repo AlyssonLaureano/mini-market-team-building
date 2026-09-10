@@ -1,8 +1,11 @@
 
+import base64
+import mimetypes
 import sqlite3
 import io
 import os
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -45,7 +48,8 @@ def init_db():
         product_name TEXT NOT NULL,
         price REAL NOT NULL DEFAULT 0,
         stock INTEGER NOT NULL DEFAULT 0,
-        initial_stock INTEGER NOT NULL DEFAULT 0
+        initial_stock INTEGER NOT NULL DEFAULT 0,
+        image_file TEXT
     );
 
     CREATE TABLE IF NOT EXISTS purchases (
@@ -79,6 +83,8 @@ def init_db():
             "ALTER TABLE products ADD COLUMN initial_stock INTEGER NOT NULL DEFAULT 0"
         )
         conn.execute("UPDATE products SET initial_stock = stock WHERE initial_stock = 0")
+    if "image_file" not in product_columns:
+        conn.execute("ALTER TABLE products ADD COLUMN image_file TEXT")
 
     purchase_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(purchases)").fetchall()
@@ -165,7 +171,7 @@ def get_groups():
 def get_products():
     conn = get_conn()
     rows = conn.execute("""
-        SELECT product_id, product_name, price, stock
+        SELECT product_id, product_name, price, stock, image_file
         FROM products
         ORDER BY product_id
     """).fetchall()
@@ -383,6 +389,37 @@ def product_icon(product_name):
     return PRODUCT_ICONS.get(product_name, "🛒")
 
 
+def product_image_source(image_file):
+    if image_file is None or pd.isna(image_file):
+        return None
+    value = str(image_file).strip()
+    if not value or value.lower() == "nan":
+        return None
+    if value.lower().startswith(("http://", "https://")):
+        return value
+    image_path = Path(value)
+    if not image_path.is_absolute():
+        image_path = DB_PATH.parent / image_path
+    return str(image_path) if image_path.exists() else None
+
+
+def product_image_markup(image_source):
+    if not image_source:
+        return None
+    if image_source.lower().startswith(("http://", "https://")):
+        source = escape(image_source, quote=True)
+    else:
+        image_path = Path(image_source)
+        mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        source = f"data:{mime_type};base64,{encoded}"
+    return (
+        '<div class="product-figure product-photo">'
+        f'<img src="{source}" alt="Imagem do produto">'
+        "</div>"
+    )
+
+
 def access_url():
     """URL acessível pelo celular na mesma rede da máquina que executa o app."""
     configured = os.getenv("MINI_MARKET_URL")
@@ -506,6 +543,7 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
         or has_reset_flag(products_df)
     )
     reset_stock_requested = sheet_reset_stock
+    has_image_column = "image_file" in products_df.columns
 
     for df, id_col, label in [
         (groups_df, "group_id", "Grupos"),
@@ -571,24 +609,32 @@ def import_admin_workbook(uploaded_file, reset_activity=False):
                 raise ValueError(f"Nome vazio para o produto {product_id}.")
             price = float(row.unit_price)
             stock = int(row.initial_stock)
+            raw_image_file = getattr(row, "image_file", None)
+            image_file = None
+            if raw_image_file is not None and not pd.isna(raw_image_file):
+                image_file = str(raw_image_file).strip() or None
             existing = conn.execute(
                 "SELECT product_id FROM products WHERE product_id = ?", (product_id,)
             ).fetchone()
             if existing and not reset_requested:
                 conn.execute(
-                    "UPDATE products SET product_name = ?, price = ? WHERE product_id = ?",
-                    (name, price, product_id),
+                    """UPDATE products
+                       SET product_name = ?, price = ?, image_file = COALESCE(?, image_file)
+                       WHERE product_id = ?""",
+                    (name, price, image_file if has_image_column else None, product_id),
                 )
             else:
                 conn.execute(
-                    """INSERT INTO products(product_id, product_name, price, stock, initial_stock)
-                       VALUES (?, ?, ?, ?, ?)
+                    """INSERT INTO products
+                       (product_id, product_name, price, stock, initial_stock, image_file)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT(product_id) DO UPDATE SET
                        product_name = excluded.product_name,
                        price = excluded.price,
                        stock = excluded.stock,
-                       initial_stock = excluded.initial_stock""",
-                    (product_id, name, price, stock, stock),
+                       initial_stock = excluded.initial_stock,
+                       image_file = COALESCE(excluded.image_file, products.image_file)""",
+                    (product_id, name, price, stock, stock, image_file if has_image_column else None),
                 )
 
         if reset_stock_requested:
@@ -615,6 +661,7 @@ def get_admin_stock():
             pr.product_id,
             pr.product_name,
             pr.price,
+            pr.image_file,
             pr.initial_stock,
             pr.stock AS final_stock,
             COALESCE(SUM(pi.quantity), 0) AS sold_units
@@ -628,6 +675,7 @@ def get_admin_stock():
         {
             "Código": row["product_id"],
             "Produto": row["product_name"],
+            "Imagem": row["image_file"],
             "Preço unitário": row["price"],
             "Estoque inicial": row["initial_stock"],
             "Estoque final": row["final_stock"],
@@ -708,6 +756,7 @@ def export_admin_workbook():
         "product_name": stock["Produto"] if not stock.empty else pd.Series(dtype="object"),
         "unit_price": stock["Preço unitário"] if not stock.empty else pd.Series(dtype="float64"),
         "initial_stock": stock["Estoque inicial"] if not stock.empty else pd.Series(dtype="int64"),
+        "image_file": stock["Imagem"] if not stock.empty else pd.Series(dtype="object"),
         "current_stock": stock["Estoque final"] if not stock.empty else pd.Series(dtype="int64"),
         "sold_units": stock["Unidades vendidas"] if not stock.empty else pd.Series(dtype="int64"),
         "sold_total": stock["Total vendido"] if not stock.empty else pd.Series(dtype="float64"),
@@ -1044,6 +1093,11 @@ st.markdown("""
     font-size: 42px;
     margin-bottom: 8px;
 }
+.product-photo img {
+    width: 100%;
+    height: 70px;
+    object-fit: contain;
+}
 .section-note { color: #667585; font-size: 13px; }
 </style>
 <div class="mini-hero">
@@ -1132,10 +1186,14 @@ with left:
     for i, product in enumerate(products):
         with product_cols[i % 3]:
             with st.container(border=True):
-                st.markdown(
-                    f'<div class="product-figure">{product_icon(product["product_name"])}</div>',
-                    unsafe_allow_html=True,
-                )
+                image_source = product_image_source(product["image_file"])
+                if image_source:
+                    st.markdown(product_image_markup(image_source), unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        f'<div class="product-figure">{product_icon(product["product_name"])}</div>',
+                        unsafe_allow_html=True,
+                    )
                 st.write(f"### {product['product_name']}")
                 st.write(f"**{money(product['price'])}**")
                 st.caption(f"Estoque: {product['stock']}")

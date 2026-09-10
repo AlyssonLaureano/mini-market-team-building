@@ -11,7 +11,8 @@ CREATE TABLE products (
     product_name TEXT NOT NULL,
     price REAL NOT NULL DEFAULT 0,
     stock INTEGER NOT NULL DEFAULT 0,
-    initial_stock INTEGER NOT NULL DEFAULT 0
+    initial_stock INTEGER NOT NULL DEFAULT 0,
+    image_file TEXT
 );
 
 CREATE TABLE purchases (
