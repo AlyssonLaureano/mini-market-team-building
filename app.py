@@ -55,6 +55,7 @@ def init_db():
         total REAL NOT NULL,
         balance_before REAL NOT NULL,
         balance_after REAL NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(group_id) REFERENCES groups(group_id)
     );
 
@@ -78,6 +79,14 @@ def init_db():
             "ALTER TABLE products ADD COLUMN initial_stock INTEGER NOT NULL DEFAULT 0"
         )
         conn.execute("UPDATE products SET initial_stock = stock WHERE initial_stock = 0")
+
+    purchase_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(purchases)").fetchall()
+    }
+    if "delivered" not in purchase_columns:
+        conn.execute(
+            "ALTER TABLE purchases ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"
+        )
 
     conn.commit()
     conn.close()
@@ -173,13 +182,31 @@ def get_purchase_history():
             g.group_name,
             p.total,
             p.balance_before,
-            p.balance_after
+            p.balance_after,
+            p.delivered
         FROM purchases p
         JOIN groups g ON g.group_id = p.group_id
         ORDER BY p.purchase_id DESC
     """).fetchall()
     conn.close()
     return rows
+
+
+def set_purchase_delivered(purchase_id, delivered):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE purchases SET delivered = ? WHERE purchase_id = ?",
+            (1 if delivered else 0, purchase_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_delivery_checkbox(purchase_id):
+    delivered = st.session_state.get(f"delivered_{purchase_id}", False)
+    set_purchase_delivered(purchase_id, delivered)
 
 
 def get_purchase_items(purchase_id):
@@ -805,9 +832,42 @@ def render_admin_screen():
     m3.metric("Total comprado", money(total_spent))
     m4.metric("Compras registradas", int(total_purchases))
 
-    tab_stock, tab_groups, tab_items, tab_charts, tab_import = st.tabs([
-        "📦 Estoque", "👥 Compras por grupo", "🧾 Itens por grupo", "📊 Gráficos", "📥 Importar Excel"
+    tab_orders, tab_stock, tab_groups, tab_items, tab_charts, tab_import = st.tabs([
+        "🧾 Pedidos", "📦 Estoque", "👥 Compras por grupo", "🧾 Itens por grupo", "📊 Gráficos", "📥 Importar Excel"
     ])
+
+    with tab_orders:
+        orders = get_purchase_history()
+        if not orders:
+            st.info("Nenhum pedido recebido ainda.")
+        else:
+            pending = sum(not bool(order["delivered"]) for order in orders)
+            st.metric("Pedidos aguardando entrega", pending)
+            st.caption("Use o checkbox de cada pedido para registrar a entrega dos ingredientes.")
+
+            for order in orders:
+                items = get_purchase_items(order["purchase_id"])
+                item_text = ", ".join(
+                    f"{item['quantity']}x {item['product_name']}"
+                    for item in items
+                )
+                order_col, check_col = st.columns([4, 1])
+                with order_col:
+                    status = "Entregue" if order["delivered"] else "Aguardando entrega"
+                    st.write(
+                        f"**Pedido #{order['purchase_id']} · {order['group_name']}**  "
+                        f"\n{order['date_time']} · {item_text} · {money(order['total'])}"
+                    )
+                    st.caption(status)
+                with check_col:
+                    st.checkbox(
+                        "Entregue",
+                        value=bool(order["delivered"]),
+                        key=f"delivered_{order['purchase_id']}",
+                        on_change=save_delivery_checkbox,
+                        args=(order["purchase_id"],),
+                    )
+                st.divider()
 
     with tab_stock:
         if stock_df.empty:

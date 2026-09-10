@@ -21,6 +21,7 @@ CREATE TABLE purchases (
     total REAL NOT NULL,
     balance_before REAL NOT NULL,
     balance_after REAL NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(group_id) REFERENCES groups(group_id)
 );
 
