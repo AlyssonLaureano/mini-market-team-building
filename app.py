@@ -763,9 +763,6 @@ with st.expander("📱 Acesso pelo celular", expanded=True):
     with info_col:
         st.write("**Escaneie o QR Code para abrir o Mini Market.**")
         st.code(url, language=None)
-        st.caption(
-            "O celular precisa estar na mesma rede Wi‑Fi da máquina que está executando o Streamlit."
-        )
 
 with st.sidebar:
     app_mode = st.radio(
