@@ -1,0 +1,5 @@
+mini_market.db
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.env
