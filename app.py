@@ -595,12 +595,42 @@ def get_group_item_summary(group_id):
     ])
 
 
+def get_group_product_summary():
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT
+            g.group_name,
+            pr.product_name,
+            SUM(pi.quantity) AS quantity,
+            SUM(pi.subtotal) AS total
+        FROM purchase_items pi
+        JOIN purchases p ON p.purchase_id = pi.purchase_id
+        JOIN groups g ON g.group_id = p.group_id
+        JOIN products pr ON pr.product_id = pi.product_id
+        GROUP BY g.group_id, g.group_name, pr.product_id, pr.product_name
+        ORDER BY g.group_id, quantity DESC
+    """).fetchall()
+    conn.close()
+    return pd.DataFrame([
+        {
+            "Grupo": row["group_name"],
+            "Produto": row["product_name"],
+            "Quantidade": row["quantity"],
+            "Total": row["total"],
+        }
+        for row in rows
+    ])
+
+
 def render_admin_screen():
     st.title("⚙️ Administração")
     st.caption("Visão consolidada do estoque, saldos e compras da atividade.")
 
     if not admin_login():
         return
+
+    if st.button("🔄 Atualizar dados", key="admin_refresh", help="Recarregar saldos, estoque e compras"):
+        st.rerun()
 
     stock_df = get_admin_stock()
     groups_df = get_admin_groups()
@@ -615,8 +645,8 @@ def render_admin_screen():
     m3.metric("Total comprado", money(total_spent))
     m4.metric("Compras registradas", int(total_purchases))
 
-    tab_stock, tab_groups, tab_items, tab_import = st.tabs([
-        "📦 Estoque", "👥 Compras por grupo", "🧾 Itens por grupo", "📥 Importar Excel"
+    tab_stock, tab_groups, tab_items, tab_charts, tab_import = st.tabs([
+        "📦 Estoque", "👥 Compras por grupo", "🧾 Itens por grupo", "📊 Gráficos", "📥 Importar Excel"
     ])
 
     with tab_stock:
@@ -652,6 +682,41 @@ def render_admin_screen():
             else:
                 items_df["Total"] = items_df["Total"].map(money)
                 st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+    with tab_charts:
+        summary_df = get_group_product_summary()
+        if summary_df.empty:
+            st.info("Os gráficos aparecerão após a primeira compra.")
+        else:
+            st.subheader("Quantidade de produtos comprados por grupo")
+            quantity_pivot = summary_df.pivot_table(
+                index="Grupo",
+                columns="Produto",
+                values="Quantidade",
+                aggfunc="sum",
+                fill_value=0,
+            )
+            st.bar_chart(quantity_pivot, use_container_width=True)
+
+            chart_left, chart_right = st.columns(2)
+            with chart_left:
+                st.subheader("Valor comprado por grupo")
+                spend_chart = groups_df.set_index("Grupo")[["Total comprado"]]
+                st.bar_chart(spend_chart, use_container_width=True)
+            with chart_right:
+                st.subheader("Estoque inicial x final")
+                stock_chart = stock_df.set_index("Produto")[["Estoque inicial", "Estoque final"]]
+                st.bar_chart(stock_chart, use_container_width=True)
+
+            st.subheader("Produtos mais comprados")
+            top_products = (
+                summary_df.groupby("Produto", as_index=True)["Quantidade"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .to_frame()
+            )
+            st.bar_chart(top_products, use_container_width=True)
 
     with tab_import:
         st.write("Use o arquivo **Mini_Market_Admin.xlsx**.")
@@ -880,32 +945,57 @@ with left:
 with right:
     st.subheader("🛍️ Carrinho")
 
-    cart_rows = []
     total = 0
+    cart_has_items = False
 
-    for product_id, quantity in st.session_state.cart.items():
+    for product_id, quantity in list(st.session_state.cart.items()):
         product = next(
             (p for p in products if p["product_id"] == product_id),
             None
         )
 
         if product:
+            available_stock = int(product["stock"])
+            safe_quantity = min(quantity, available_stock)
+            if safe_quantity != quantity:
+                st.session_state.cart[product_id] = safe_quantity
+                quantity = safe_quantity
+
+            if quantity <= 0:
+                st.session_state.cart.pop(product_id, None)
+                continue
+
+            cart_has_items = True
+            c1, c2, c3, c4 = st.columns([1.35, 0.75, 0.9, 0.35])
+            with c1:
+                st.write(f"**{product['product_name']}**")
+                st.caption(f"Unitário: {money(product['price'])}")
+            with c2:
+                new_quantity = st.number_input(
+                    "Quantidade",
+                    min_value=0,
+                    max_value=available_stock,
+                    value=quantity,
+                    step=1,
+                    key=f"cart_quantity_{product_id}",
+                    label_visibility="collapsed",
+                )
+                if new_quantity != quantity:
+                    if new_quantity == 0:
+                        st.session_state.cart.pop(product_id, None)
+                    else:
+                        st.session_state.cart[product_id] = new_quantity
+                    st.rerun()
             subtotal = product["price"] * quantity
             total += subtotal
+            with c3:
+                st.write(f"**{money(subtotal)}**")
+            with c4:
+                if st.button("🗑️", key=f"remove_cart_{product_id}", help="Remover item"):
+                    st.session_state.cart.pop(product_id, None)
+                    st.rerun()
 
-            cart_rows.append({
-                "Produto": product["product_name"],
-                "Qtd": quantity,
-                "Unitário": money(product["price"]),
-                "Subtotal": money(subtotal),
-            })
-
-    if cart_rows:
-        st.dataframe(
-            pd.DataFrame(cart_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
+    if cart_has_items:
 
         st.markdown(f"### Total: {money(total)}")
 
